@@ -1,0 +1,716 @@
+---
+title: "Report"
+author: "Miguel Angel Donado Fernandez"
+date: "02/may/2025"
+format:
+  html:
+    self-contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(reticulate)
+use_virtualenv("~/.venvs/deep_neural_network3.9")
+# Check Python is being properly executed in R
+py_config()
+```
+
+```{python py_setup, include=FALSE}
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+```
+
+##### First of all, I've to clarify some aspects about the environment used:
+
+1.  I've used R and Python for this assignment. So some of the code chunks are in R and another in Python. 2. The library **reticulate** allows interoperability between both.
+2.  Usually I'd use only one programming language, but before this report I have done another one in R but the wrong way (using AI libraries).
+3.  So, I believed that I could be useful to reuse as much as possible of that R code (loading, normalization, plotting receptive fields...) and only change the code related to the Neural network.
+4.  To implement the model, I chose an OOP (object-oriented-programming) approach. I prefer to use python for this part, since I already know how to implement OOP in python, whereas in R not (i guess the logic is the same, but some of the syntax would be different).
+
+## Syntax cheatsheet
+
+```{r}
+# apply: Apply a function to each column of matrix (margin = 2)
+# rev: reverses values in each column
+# map_dfr: Directly binds the rows when map output is a df
+# as_table(): Converts a matrix into a table that EXPLICITLY includes:
+#   1. row indices
+#   2. column indices
+#   3. values
+# Example: A 28x28 image becomes a table with 784 rows (one row per pixel) and 3 columns (pixel row, pixel column and pixel value)
+# 4. geom_raster(): To create heatmaps or pixel-like visualizations
+#   - Faster than geom_tile
+#   - Only works with regular grids (in our case its ok, 28x28)
+# 5. facet_wrap: Creates a grid of small plots
+#   - facet_wrap(~ neuron): Make one subplot per unique value of neuron
+#   - ncol = 10: Place the subplots in 10 columns
+# 6. pmax (element-wise) version of max()
+# 7. %*%: Matrix multiplication
+# 8. r. : To access r variables from python
+```
+
+## Setup
+
+```{r r_setup}
+# Other setup
+library(tidyverse)
+library(caret)
+# ML/AI specific setup
+library(keras3)
+```
+
+## Exercise 1: Download MNIST database
+
+```{r Load_MNIST_images}
+mnist <- dataset_mnist()
+x_train <- mnist$train$x
+y_train <- mnist$train$y
+
+x_test <- mnist$test$x
+y_test <- mnist$test$y
+```
+
+## Exercise 2: Randomly pick 10.000 training examples and 1.000 test
+
+```{r Sample}
+set.seed(42)
+
+# Sample indices
+train_idx <- sample(1:length(y_train), 10000)
+test_idx <- sample(1:length(y_test), 1000)
+
+# Subset data
+x_train_sample <- x_train[train_idx,,]
+y_train_sample <- y_train[train_idx]
+
+x_test_sample <- x_test[test_idx,,]
+y_test_sample <- y_test[test_idx]
+
+table(y_train_sample)
+table(y_test_sample)
+```
+
+```{r Normalize}
+# Flatten each image of 28x28 into a vector of length 784
+dim(x_train_sample) <- c(nrow(x_train_sample), 784)
+dim(x_test_sample) <- c(nrow(x_test_sample), 784)
+
+dim(x_train_sample)
+length(y_train_sample)
+
+dim(x_test_sample)
+length(y_test_sample)
+
+x_train_sample <- x_train_sample / 255
+x_test_sample <- x_test_sample / 255
+```
+
+```{r Visualize}
+# Visualize first 9 images of training examples
+par(mfrow = c(3,3)) # 3x3 layout
+
+for (i in 1:9) {
+  # Reshape 784 length vector to a 28x28 matrix
+  img <- matrix(x_train_sample[i,], nrow = 28, byrow = TRUE)
+  
+  # I first plot the images, and they were rotated, so I must first flip them
+  img_rotated <- t(apply(img, 1, rev))
+  
+  # Plot image
+    image(1:28, 1:28, img_rotated, col = gray.colors(256))
+}
+```
+
+## Exercise 3: Build a NN with two hidden layers of size 60 and 40 (from scratch)
+
+### In order to apply backpropagation + gradient descent we need to create several things before.
+
+#### 1. One-hot encoding function
+
+-   Convert true labels (integers) to one hot encoded vectors
+
+```{r One-hot-encoding-labels}
+one_hot_encode <- function(labels) {
+  # Get unique categories
+  categories <- sort(unique(labels))
+  
+  # Create empty matrix of zeros
+  one_hot <- matrix(0, nrow = length(labels), ncol = length(categories))
+  
+  # Set column names
+  colnames(one_hot) <- categories
+  
+  # Fill matrix with 1s in appropiate positions
+  for (i in seq_along(labels)) {
+    col_index <- which(categories == labels[i])
+    one_hot[i,col_index] <- 1
+  }
+  return(one_hot)
+}
+y_train_sample_cat <- one_hot_encode(y_train_sample)
+dim(y_train_sample_cat)
+y_test_sample_cat <- one_hot_encode(y_test_sample)
+dim(y_test_sample_cat)
+```
+
+#### 2. ReLU activation function (forward) and its derivative (backward)
+
+```{python ReLU}
+# 1. ReLU (vectorized)
+# It can work at once for all the pre-activation inputs of a layer
+def relu(z):
+    return np.maximum(0, z)
+
+# 2. ReLU derivative (vectorized)
+# Not differentiable at 0, but in practice derivative is defined as 0 on z = 0
+def relu_derivative(z):
+    return (z > 0).astype(float)
+
+```
+
+#### 3. Softmax activation function (forward) and its derivative (backward)
+
+```{python Softmax}
+# 1. Softmax (vectorized)
+# It can work at once for all the pre-activation inputs of a layer
+def softmax(z):
+    exp_z = np.exp(z - np.max(z))  # numerical stability
+    return exp_z / np.sum(exp_z)
+
+
+# 2. Softmax + cross-entropy derivative (vectorized)
+# Error signal of the output layer when the activation function of output layer is softmax and true labels encoded as one-hot
+def cross_entropy_softmax_derivative(z, y):
+    probs = softmax(z)
+    return probs - y
+```
+
+##### Aclaration: **Softmax numerical stability**
+
+1.  General formula of softmax activation of the k-th output $$a_k = \frac{\mathrm{e}^{z_k}}{\sum_j^K \mathrm{e}^{z_j}}$$
+2.  ¿Why I substract max(z)?
+
+-   To prevent numerical instability
+-   Let's say the pre-activation input for a specific neuron is very high, e.g. $z_k = 1000000$
+-   Then when applying the softmax activation, we'd have $e^{z_k} = e^1000000$, and so numerically instable
+-   We use instead: $$a_k = \frac{\mathrm{e}^{z_k-max(z)}}{\sum_j^K \mathrm{e}^{z_j-max(z)}}$$
+-   Thats equivalent because we substract on both numerator and denominator
+
+##### Aclaration: **Derivative of softmax**
+
+-   If I simply compute the **derivative of the softmax function**, I'd get a Jacobian matrix (more complex and computationally expensive)
+-   But if I compute the **derivative of softmax + cross_entropy**, the derivative is very simple and I avoid computing full Jacobian.
+
+###### Terminology:
+
+-   $z = (z_1,\ldots,z_c) \in \mathrm{R}^C$ are the pre-activation inputs
+-   $\hat{y_i} = softmax(z_i) = \frac{e^{z_i}}{\sum_{j=1}^C}e^{z_j}$
+-   $y = (y_1, \ldots, y_c)$ is the true one-hot encoded vector
+-   Cross-entropy loss $L = -\sum^C_{i=1}y_i \log(\hat{y_i})$
+
+###### Proof $\nabla_zL = \hat{y} - y$
+
+1.  $$\frac{d L}{d z_k} = \sum_{i=1}^c \frac{d L}{d \hat{y_i}} \frac{d \hat{y_i}}{d z_k}$$
+2.  Derivative of cross entropy w.r.t. $\hat{y_i}$ $$\frac{d L}{d \hat{y}_i} = \frac{d}{d \hat{y_i}} (-\sum^c_{j=1}y_j\log(\hat{y_j}) = \frac{d}{d \hat{y_i}} (-y_i\log(\hat{y_i}) = -\frac{y_i}{\hat{y_i}}$$ Only the j = i term contributes
+3.  Derivative of softmax output (Jacobian matrix) $$
+    \frac{d \hat{y_i}}{d z_k} =
+    \begin{cases}
+    \hat{y_i}(1-\hat{y_i}) & \text{if } i = k \\
+    -\hat{y_i}\hat{y_k} & \text{if } i \neq k
+    \end{cases}
+    $$
+4.  $$\frac{d L}{d z_k} = \sum_{i=1}{C}(-\frac{y_i}{\hat{y_i}}\frac{d \hat{y_i}}{d z_k}$$
+5.  Split the sum for i=k and i != k
+6.  For i=k $$-\frac{y_k}{\hat{y_k}} \cdot \hat{y_k}(1 - \hat{y_k}) = -y_k(1 - \hat{y_k})$$
+7.  For i!=k $$\sum(\frac{-y_i}{\hat{y_i}})(-\hat{y_i}\hat{y_k})=\sum_{i \neq k}y_i\hat{y_k}=\hat{y_k}\sum_{i \neq k}y_i = \hat{y_k}(1-y_k)$$ $$\sum_i y_i = 1 \Rightarrow \sum_{i \neq k}{y_i}=1-y_k$$
+8.  Combine both parts $$\frac{d L}{d z_k} = -y_k(1-\hat{y_k}+\hat{y_k}(1-y_k) = \hat{y_k}-y_k \, \forall k \in C$$
+9.  Then $\nabla_zL = \hat{y} - y$
+
+#### 4. Loss function (categorical cross entropy)
+
+```{python Loss_categorical_cross_entropy}
+def categorical_cross_entropy(y_true, y_pred, epsilon=1e-15):
+    # Convert to NumPy arrays (if not already)
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    
+    # Check that lengths match
+    if y_true.shape != y_pred.shape:
+        raise ValueError("y_true and y_pred must have the same shape")
+    
+    # Clip predictions for numerical stability
+    y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+    
+    return -np.sum(y_true * np.log(y_pred))
+```
+
+-   To ensure numerical stability: *Clip predictions*
+    -   Force predicted probabilities to stay within a safe range: $[\epsilon, 1-\epsilon]$
+
+#### 5. Weights initialization
+
+-   One of the best ways for a neural network with ReLU in all hidden layers and softmax in output layer, is **Glorot Initialization** $W \sim \mathcal{N}\left(0, \frac{2}{N_{\text{in}} + N_{\text{out}}} \right)$
+-   Normally, I'd would create this as a method of the model class, but not on this case, for the sake of write markdown explanations
+
+```{python Weights_initialization}
+def xavier_normal_initialization(input_size, output_size):
+    # Argument checks
+    if not isinstance(input_size, int) or input_size <= 0:
+        raise ValueError("input_size must be a positive integer")
+    
+    if not isinstance(output_size, int) or output_size <= 0:
+        raise ValueError("output_size must be a positive integer")
+    
+    # Xavier normal stddev
+    stddev = np.sqrt(2 / (input_size + output_size))
+    
+    # Initialize weights and biases
+    weights = np.random.normal(loc=0.0, scale=stddev, size=(output_size, input_size))
+    biases = np.zeros(output_size)
+    
+    return [weights, biases]
+```
+
+#### 6. Forward pass function $z = Wx + b$
+
+-   Normally, I'd would create this as a method of the model class, but not on this case, for the sake of write markdown explanations
+
+```{python Forward_pass}
+def forward_pass(x, weights_list, biases_list, activations_list):
+  """
+  x: vector (input)
+  weights_list: list of weight matrices, one per layer
+  biases_list: list of bias vectors, one per layer
+  activations_list: list of strings 'relu','softmax'...
+  
+  Returns: list of dictionaries, with 'z' and 'a' per layer
+  """
+  a = x
+  z_list = []
+  a_list = [x]
+  
+  for weights, biases, activation in zip(weights_list, biases_list, activations_list):
+    z = np.dot(weights, a) + biases
+    
+    if activation == "relu":
+      a = relu(z)
+    else:
+      a = softmax(z)
+    
+    z_list.append(z)
+    a_list.append(a)
+  
+  return [z_list, a_list]  
+```
+
+#### 7. Backward pass function (as saw in the slides)
+
+-   Step 1: Output layer
+    -   Compute error signal of neurons in the layer
+    -   Compute gradient wrt weights and biases
+-   Step 2: Rest of layers
+    -   Compute error signal of neurons in the layer
+    -   Compute gradient wrt weights and biases
+-   Normally, I'd would create this as a method of the model class, but not on this case, for the sake of write markdown explanations
+
+```{python}
+def backward_pass(y_true, a_list, z_list, weights, activations):
+    """
+    y_true: One-hot encoded vector true labels
+    a_list: list of activations per layer (contains a[0])
+    z_list: list of pre-activations per layer
+    weights: list of matrices vector, one per layer
+    activations: list of activations strings, one per layer
+
+    Returns:
+    grad_weights: list of gradients wrt weights
+    grad_biases: list of gradients wrt biases
+    """
+    L = len(z_list)  # number of layers without counting input
+
+    assert len(weights) == L, f"[ERROR] len(weights) = {len(weights)}, expected {L}"
+    assert len(activations) == L, f"[ERROR] len(activations) = {len(activations)}, expected {L}"
+    assert len(a_list) == L + 1, f"[ERROR] len(a_list) = {len(a_list)}, expected {L + 1}"
+
+    grad_weights = [None] * L
+    grad_biases = [None] * L
+
+    # ----------------------------
+    # Output layer
+    # ----------------------------
+    z_L = z_list[-1]
+    a_prev = a_list[-2]
+    delta = cross_entropy_softmax_derivative(z=z_L, y=y_true)
+
+    grad_weights[-1] = np.outer(delta, a_prev)
+    grad_biases[-1] = delta
+
+    # ----------------------------
+    # Hidden layers (L-2 to 0)
+    # ----------------------------
+    for l in reversed(range(L - 1)):
+        z = z_list[l]
+        a_prev = a_list[l]
+        W_next = weights[l + 1]
+        delta_next = delta
+
+        if activations[l] == "relu":
+            dz = relu_derivative(z)
+        else:
+            raise NotImplementedError(f"Activation '{activations[l]}' not supported")
+
+        delta = np.dot(W_next.T, delta_next) * dz
+
+        grad_weights[l] = np.outer(delta, a_prev)
+        grad_biases[l] = delta
+    return [grad_weights, grad_biases]
+```
+
+### 8. Create class "Model" (OOP)
+
+```{python model_class}
+from prettytable import PrettyTable 
+
+class Model:
+  """
+  Layers: We pass all layers (input, hidden and output). List of lists,
+  [[name, input_size, output_size, activation_func],...]
+  
+  self.inputs: a[0]
+  self.forward_pass: "z" and "a", but from range([1],[output_layer]) so the a[0] is not included
+  """
+  
+  def __init__(
+    self, 
+    input_shape: int,
+    output_shape: int,
+    layers: list
+  ):
+      self.input_shape = input_shape
+      self.output_shape = output_shape
+      self.layers = layers  # [[name, input_size, output_size, activations],...]
+      self.activations = [layer[-1] for layer in layers][1:]
+      
+  def __repr__(self):
+    return f"Model({self.input_shape}, {self.output_shape}, {self.layers})"
+  
+  def __count_params(self, layer):
+    weights = layer[1] * layer[2]
+    bias = layer[2] if layer[1] != 0 else 0
+    return weights + bias
+  
+  def summary(self):
+    total_params = 0
+    table = PrettyTable()
+    table.field_names = ["Layer (name)", "Output Shape", "Param #"]
+    
+    for layer in self.layers:
+      name = f"{layer[0]}"
+      output_shape = f"(None, {layer[2]})"
+      param_count = self.__count_params(layer)
+      total_params += param_count
+      table.add_row([name, output_shape, param_count])
+    
+    table.align["Layer (name)"] = "l"
+    table.align["Output Shape"] = "l"
+    table.align["Param #"] = "r"
+  
+    print(table)
+    print(f"Total params: {total_params:,}")
+    
+  def plot_history(self):
+      epochs = self.history["epoch"]
+      acc = self.history["accuracy"]
+      loss = self.history["loss"]
+  
+      fig, axs = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+  
+      # Accuracy plot
+      axs[0].plot(epochs, acc, marker='o', color='red', label='training')
+      axs[0].set_ylabel("accuracy")
+      axs[0].legend()
+      axs[0].grid(True)
+      axs[0].xaxis.set_major_locator(MaxNLocator(integer=True))
+      
+      # Loss plot
+      axs[1].plot(epochs, loss, marker='o', color='blue', label='training')
+      axs[1].set_xlabel("epoch")
+      axs[1].set_ylabel("loss")
+      axs[1].legend()
+      axs[1].grid(True)
+      axs[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+  
+      plt.tight_layout()
+      plt.show()
+
+  
+  def __initialization_weights(self):
+    # Initialize weights and biases
+    """
+    self.weights: List of np.arrays(one np.array per layer)
+    self.biases: List of np.arrays(one np.array per layer)
+    """
+    self.weights = []
+    self.biases = []
+    for layer in self.layers:
+      name, input_size, output_size, activation = layer
+      if input_size == 0:  # Input layer
+        continue 
+      weights, biases = xavier_normal_initialization(input_size, output_size)
+      self.weights.append(weights)
+      self.biases.append(biases)
+      
+  def compile_model(self, optimizer="sdg", loss = "categorical_crossentropy", metrics="accuracy", learning_rate = 0.01):
+      self.optimizer = optimizer
+      self.loss_function = loss
+      self.metrics = metrics
+      self.learning_rate = learning_rate
+    
+  def fit(self, inputs, outputs, epochs, batch_size = 1, validation_split = 0):
+    self.inputs = np.array(inputs, dtype=np.float32)
+    self.outputs = np.array(outputs, dtype = np.float32)  # True labels
+    self.epochs = epochs
+    self.batch_size = batch_size
+    # Not hyperparameter tuning, so we dont need any validation split
+    self.validation_split = validation_split
+    
+    # Initialize weights layers randomly
+    self.__initialization_weights()
+    
+    self.history = {
+      "epoch": [],
+      "loss": [],
+      "accuracy": []
+    }
+    
+    # Iterate epochs
+    for epoch in range(epochs):
+      epoch_loss = 0
+      correct = 0
+      total = self.inputs.shape[0]
+      # Iterate data points (stochastic gradient)
+      for i in range(self.inputs.shape[0]):
+        # Data point
+        self.x = self.inputs[i]
+        self.y_true = self.outputs[i]
+        
+        # Forward pass (stores z and a for each layer)
+        self.z, self.a = forward_pass(self.x, self.weights, self.biases, self.activations)
+        
+        # Compute loss
+        self.y_pred = self.a[-1]
+        self.loss_value = categorical_cross_entropy(y_true=self.y_true, y_pred=self.y_pred)
+        
+        epoch_loss += self.loss_value
+        
+        pred_class = np.argmax(self.y_pred)
+        true_class = np.argmax(self.y_true)
+        if pred_class == true_class:
+          correct += 1
+        
+        # Backpropagation pass
+        self.grad_W, self.grad_b = backward_pass(self.y_true, self.a, self.z, self.weights, self.activations)
+        
+        # Update parameters capa por capa
+        for layer_index in range(len(self.weights)):
+            self.weights[layer_index] -= self.learning_rate * self.grad_W[layer_index]
+            self.biases[layer_index]  -= self.learning_rate * self.grad_b[layer_index]
+      
+      # End of epoch
+      avg_loss = epoch_loss / total
+      accuracy = correct / total
+      self.history["epoch"].append(epoch + 1)
+      self.history["loss"].append(avg_loss)
+      self.history["accuracy"].append(accuracy)
+
+        
+      
+      print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f} - accuracy: {accuracy:.4f}")
+  
+  def evaluate(self, inputs, targets, verbose = 1):
+    """
+    Evaluate accuracy and average loss on a dataset
+    
+    inputs (np.ndarray): shape (n_samples, input_dim)
+    targets (np.ndarray): shape (n_samples, n_classes), one-hot encoded
+    
+    Returns:
+      accuracy (float)
+      average_loss (float)
+    """
+    inputs = np.array(inputs, dtype = np.float32)
+    targets = np.array(targets, dtype = np.float32)
+    
+    total = inputs.shape[0]
+    correct = 0
+    total_loss = 0
+    
+    for i in range(total):
+      x = inputs[i]
+      y_true = targets[i]
+      
+      z_list, a_list = forward_pass(x, self.weights, self.biases, self.activations)
+      y_pred = a_list[-1]
+      
+      loss = categorical_cross_entropy(y_true, y_pred)
+      total_loss += loss
+      
+      if np.argmax(y_pred) == np.argmax(y_true):
+        correct += 1
+    
+    avg_loss = total_loss / total
+    accuracy = correct / total
+    
+    if verbose:
+      print(f"Evaluation - loss: {avg_loss:.4f} - accuracy: {accuracy:.4f}")
+    
+    return accuracy, avg_loss
+  
+  def predict(self, inputs):
+    """
+    Predict class indices for input samples
+    
+    inputs (np.ndarray): shape (n_samples, input_dim)
+    
+    Returns:
+      np.ndarray: predicted class indices, shape (n_samples,)
+    """
+    inputs = np.array(inputs, dtype = np.float32)
+    preds = []
+    
+    for x in inputs:
+      z_list, a_list = forward_pass(x, self.weights, self.biases, self.activations)
+      y_pred = a_list[-1]
+      pred_class = np.argmax(y_pred)
+      preds.append(pred_class)
+      
+    return np.array(preds)
+```
+
+#### Aclarations about hyperparameter tuning and validation
+
+-   For the sake of simplicity, **I'm assuming that I'm not doing any hyperparameter tuning**, and so there is no need for a validation set.
+-   **I can use all the training set to train my model.**
+-   Some of the most important hyperparameters has already been explicitly stated on the exercise instructions (number of layers, number of units on each layer). Even so, there are more hyperparameters that still could be tuned: Activation functions to use on hidden layers, number of epochs...
+
+#### Brief explanation about the model workings
+
+-   I stick to create a **model class that implemented everything that we've seen on the slides** and that can be used to classify mnist dataset, so **I'm assuming several things**:
+    1.  **ReLU in all hidden layers, and softmax in output layer**
+    2.  **SGD** as optimizer. I'm not doing vanilla gradient descent, or minibatch gradient descent...
+    3.  Im using **basic SGD**, Im not implementing momentum or adaptive gradient.
+    4.  **No hyperparameter tuning**, so no need for validation
+    5.  ...
+
+```{python create_symbolic_model}
+model = Model(
+  input_shape = 784, 
+  output_shape = 10, 
+  layers = [
+    ["initial_layer", 0, 784, ""],
+    ["first_hidden_layer", 784, 60, "relu"],
+    ["second_hidden_layer", 60, 40, "relu"],
+    ["output_layer", 40, 10, "softmax"]
+  ]
+)
+
+model.summary()
+model.compile_model()
+```
+
+```{python train_model}
+model.fit(inputs=r.x_train_sample, outputs = r.y_train_sample_cat, epochs = 5)
+```
+
+```{python history_model}
+model.plot_history()
+```
+
+### Exercise 4: Evaluate the classification performance
+
+```{python evaluate}
+accuracy, loss = model.evaluate(inputs = r.x_test_sample, targets = r.y_test_sample_cat, verbose = 0)
+print(f"Test loss: ", round(loss, 4))
+print(f"Test acccuracy: ", round(accuracy, 4))
+```
+
+```{python predict}
+y_pred = model.predict(r.x_test_sample)
+print(y_pred[0:100])
+```
+
+```{r Confusion matrix}
+# Python ndarray
+y_pred <- (py$y_pred)
+y_pred <- py_to_r(y_pred)
+
+# Number of digits
+num_digits <- length(unique(y_train_sample))
+
+confusionMatrix(
+  factor(y_pred, levels = 0:(num_digits-1)),
+  factor(y_test_sample, levels = 0:(num_digits-1)),
+)
+```
+
+### Exercise 5: Examine the receptive fields of neurons in the hidden layers
+
+-   **Receptive field of a neuron**: As we've seen on the slides, it's the **weights of the preactivation input**. It tells us what features the network is learning to detect.
+
+-   **For a neuron in the first hidden layer**, its receptive field is a 784-dimensional weight vector, one weight for each pixel in the input image
+
+-   **For a neuron in the second hidden layer**, its receptive field is a 60-dimensional weight vector, one weight for each of the 60 neurons of the previous hidden layer.
+
+-   **For a neuron in the output layer**, its receptive field is a 40-dimensional weight vector, one weight for each of the 40 neurons of the previous hidden layer.
+
+-   Receptive fields of early hidden layers are easier to interpret. In this case, that we're talking about images, **I'll analyze just the receptive field of several neurons in layer 1.**
+
+    -   The layer 1 is directly connected to the input pixels, so it tells us what features the network is learning to detect (edges, corner...)
+
+-   On next hidden layers, the neurons are connected to high-level representations, not directly to pixels, so the weights are harder to visualize as images.
+
+-   For the weights, we apply to them the **minmax normalization**: $$x' = \frac{x -min(x)}{max(x)-min(x)}$$
+
+```{r Access_python_model_weights}
+r_model <- py$model
+# Weights first hidden layer
+w <- r_model['weights'][1][[1]]
+w <- t(w)
+dim(w)
+```
+
+```{r Receptive_field_hidden1}
+# Convert to format for tidyverse ecosystem
+plot_data <- map_dfr(1:60, function(i) {
+  rf <- matrix(w[, i], nrow = 28, byrow = TRUE)
+  rf <- t(apply(rf, 2, rev))  # To put it in the right orientation
+  rf_df <- as.data.frame(as.table(rf))  # Convert matrix to tibble and some extra modifications
+  colnames(rf_df) <- c("y", "x", "value")
+  rf_df <- rf_df %>%
+    mutate(x = as.integer(x),
+           y = as.integer(y),
+           neuron = paste0("N", str_pad(i, width = 2, pad = "0")),
+           value = (value - min(value)) / (max(value) - min(value)))  # minmax normalization of weights
+})
+
+# Plot
+#  - fill = value: Set the color of each pixel in the receptive field based on neuron's weight
+# > Tried to use same color palette than in slides:
+#  - Bright colors for large weights
+#  - Dark colors for small weights
+# > coord_fixed(): Fixes aspect ratio of the plot
+# > 
+ggplot(plot_data, aes(x = x, y = y, fill = value)) +
+  geom_raster() +
+  scale_fill_gradientn(colors = heat.colors(256)) +    
+  coord_fixed() +
+  facet_wrap(~ neuron, ncol = 10) +
+  theme_void() +   # Minimalistic theme
+  theme(strip.text = element_text(size = 8), # Control appearance of facet labels 
+        panel.spacing = unit(0.5, "lines"))  # Set space between facet panels
+```
+
+-   We can see, that a bunch of neurons (N15, N17...) are unstructured (so this neurons are not being used efficiently by the model).
+-   We can see, that most neurons emphasize central pixels (so it has sense taking into account the images are digits from MNIST)
